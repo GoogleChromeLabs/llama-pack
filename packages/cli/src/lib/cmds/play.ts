@@ -14,10 +14,7 @@
  *  limitations under the License.
  */
 
-import {
-  Config, GradleWrapper, JdkHelper, AndroidSdkTools, ConsoleLog, Log, GooglePlay, TwaManifest,
-  asPlayStoreTrack,
-} from '@bubblewrap/core';
+import {GooglePlay, TwaManifest, asPlayStoreTrack} from '@bubblewrap/core';
 import * as fs from 'fs';
 import * as path from 'path';
 import {TWA_MANIFEST_FILE_NAME} from '../constants';
@@ -46,21 +43,12 @@ class Play {
   ) {}
 
   /**
-  * Bootstraps the Play listing via the Gradle-Play-Plugin.
-  * @return {void}
-  */
-  async bootstrapPlay(): Promise<void> {
-    await this.googlePlay.initPlay();
-  }
-
-  /**
   * @summary Can validate the largest version number vs twa-manifest.json and update
   * to give x+1 version number.
   * @return {number} The largest version number found in the play console.
   */
   async getLargestVersion(twaManifest: TwaManifest): Promise<number> {
-    const versionNumber = await this.googlePlay.getLargestVersionCode(
-        twaManifest.packageId, twaManifest.serviceAccountJsonFile!);
+    const versionNumber = await this.googlePlay.getLargestVersionCode(twaManifest.packageId);
     return versionNumber;
   }
 
@@ -68,7 +56,7 @@ class Play {
   * Publishes the Android App Bundle to the specified from the {@link PlayArgs}.
   * @return {boolean} Whether the publish command completes successfully or not.
   */
-  async publish(): Promise<boolean> {
+  async publish(twaManifest: TwaManifest): Promise<boolean> {
     // Validate that the publish value is listed in the available Tracks.
     // If no value was supplied with publish we make it internal.
     const userSelectedTrack = asPlayStoreTrack(this.args.publish?.toLowerCase() || 'internal');
@@ -78,43 +66,52 @@ class Play {
     }
     // appbundlelocation is an option argument.
     if (this.args.appBundleLocation && fs.existsSync(this.args.appBundleLocation!!)) {
-      await this.googlePlay.publishBundle(userSelectedTrack, this.args.appBundleLocation);
-      return true;
+      return await this.internalPublish(
+          this.args.appBundleLocation,
+          userSelectedTrack,
+          twaManifest,
+      );
     }
-    // Make tmp directory copy file over signed APK then cleanup.
-    const publishDir = fs.mkdtempSync('bubblewrap');
-    const signedAppBundleFileName = 'app-release-bundle.aab';
+
+    const defaultSignedAppBundleFileName = 'app-release-bundle.aab';
     // Where we should find our output file
-    const defaultPath = path.join(process.cwd(), signedAppBundleFileName);
+    const defaultPath = path.join(process.cwd(), defaultSignedAppBundleFileName);
 
-    fs.copyFileSync(defaultPath, path.join(publishDir, signedAppBundleFileName));
-    await this.googlePlay.publishBundle(userSelectedTrack, publishDir);
+    return await this.internalPublish(defaultPath, userSelectedTrack, twaManifest);
+  }
 
-    fs.unlinkSync(path.join(publishDir, signedAppBundleFileName));
-    fs.rmdirSync(publishDir);
+  /**
+  * Calls the internalPublish commands.
+  * @return {boolean} Whether the publish command completes successfully or not.
+  */
+  private async internalPublish(
+      bundleLocation: string,
+      userSelectedTrack: string,
+      twaManifest: TwaManifest,
+  ): Promise<boolean> {
+    await this.googlePlay.publishBundle(
+        userSelectedTrack,
+        bundleLocation,
+        twaManifest.packageId,
+        [], // TODO: add a retainedBundles array to the twaManifest.
+    );
     return true;
   }
 
   /**
-  * Validates that the service account JSON file exists.
-  * @param {string | undefined} path - The path the the JSON file.
-  * @return {boolean} Whether or not the JSON file exists.
+  * Updates the gradle file based on the updates to the twa-manifest.json file and warns the user
+  *   that they need to call build again.
+  * @param {string} manifestFile - The path to the the TwaManifest JSON file.
+  * @param {string} appVersionName - Optional: Changes the string representation of the version.
   */
-  private validServiceAccountJsonFile(path: string | undefined): boolean {
-    if (path == undefined) {
-      // Log an error
-      return false;
-    }
-    if (!fs.existsSync(path)) {
-      // path doesn't exist log an error
-      return false;
-    }
-    return true;
-  }
-
-  private async updateProjectAndWarn(manifestFile: string): Promise<void> {
+  private async updateProjectAndWarn(manifestFile: string, appVersionName?: string): Promise<void> {
     await updateProject(
-        true, null, this.prompt, this.args.targetDirectory || process.cwd(), manifestFile);
+        true,
+        (appVersionName || null),
+        this.prompt,
+        this.args.targetDirectory || process.cwd(),
+        manifestFile,
+    );
     this.prompt.printMessage(enUS.messageCallBubblewrapBuild);
   }
 
@@ -126,26 +123,9 @@ class Play {
     if (!await this.prompt.promptConfirm(enUS.promptExperimentalFeature, false)) {
       return true;
     }
+
     const manifestFile = this.args.manifest || path.join(process.cwd(), TWA_MANIFEST_FILE_NAME);
     const twaManifest = await TwaManifest.fromFile(manifestFile);
-    // Update the TWA-Manifest if service account is supplied
-    // bubblewrap play --serviceAccountFile="/path/to/service-account.json"
-    // --manifest="/path/twa-manifest.json"
-    if (this.args.serviceAccountFile) {
-      twaManifest.serviceAccountJsonFile = this.args.serviceAccountFile;
-      twaManifest.saveToFile(manifestFile);
-      // Then we need to call bubblewrap update so the gradle plugin has the appropriate file.
-      await this.updateProjectAndWarn(manifestFile);
-    }
-    if (!this.validServiceAccountJsonFile(twaManifest.serviceAccountJsonFile)) {
-      this.prompt.printMessage(enUS.messageServiceAccountJSONMissing);
-      return false;
-    }
-
-    // bubblewrap play --init
-    if (this.args.init) {
-      await this.bootstrapPlay();
-    }
 
     // bubblewrap play --versionCheck
     if (this.args.versionCheck) {
@@ -163,7 +143,7 @@ class Play {
 
     // bubblewrap play --publish
     if (this.args.publish) {
-      const success = await this.publish();
+      const success = await this.publish(twaManifest);
       if (!success) {
         this.prompt.printMessage(enUS.messagePublishingWasNotSuccessful);
         return false;
@@ -175,12 +155,43 @@ class Play {
   }
 }
 
-export async function play(config: Config, parsedArgs: PlayArgs,
-    log: Log = new ConsoleLog('play'), prompt: Prompt = new InquirerPrompt()): Promise<boolean> {
-  const jdkHelper = new JdkHelper(process, config);
-  const androidSdkTools = await AndroidSdkTools.create(process, config, jdkHelper, log);
-  const gradleWrapper = new GradleWrapper(process, androidSdkTools);
-  const googlePlay = new GooglePlay(gradleWrapper);
+/**
+  * Validates that the service account JSON file exists.
+  * @param {string | undefined} path - The path the the JSON file.
+  * @return {boolean} Whether or not the JSON file exists.
+  */
+function validServiceAccountJsonFile(path: string | undefined): boolean {
+  if (path == undefined) {
+    // Log an error
+    return false;
+  }
+  if (!fs.existsSync(path)) {
+    // path doesn't exist log an error
+    return false;
+  }
+  return true;
+}
+
+async function setupGooglePlay(args: PlayArgs): Promise<GooglePlay> {
+  const manifestFile = args.manifest || path.join(process.cwd(), TWA_MANIFEST_FILE_NAME);
+  const twaManifest = await TwaManifest.fromFile(manifestFile);
+  // Update the TWA-Manifest if service account is supplied
+  // bubblewrap play --serviceAccountFile="/path/to/service-account.json"
+  // --manifest="/path/twa-manifest.json"
+  if (args.serviceAccountFile) {
+    twaManifest.serviceAccountJsonFile = args.serviceAccountFile;
+    await twaManifest.saveToFile(manifestFile);
+  }
+  if (!validServiceAccountJsonFile(twaManifest.serviceAccountJsonFile)) {
+    throw new Error('enUS.messageServiceAccountJSONMissing');
+  }
+  // Setup Google Play since we can confirm that the serviceAccountJsonFile is valid.
+  return new GooglePlay(twaManifest.serviceAccountJsonFile!);
+}
+
+export async function play(parsedArgs: PlayArgs,
+    prompt: Prompt = new InquirerPrompt()): Promise<boolean> {
+  const googlePlay = await setupGooglePlay(parsedArgs);
   const play = new Play(parsedArgs, googlePlay, prompt);
   await play.run();
   return true;
